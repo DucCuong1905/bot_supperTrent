@@ -10,6 +10,20 @@ export function stopBacktestExecution() {
   isRunning = false;
 }
 
+export interface SuperTrendBar {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  tr: number;
+  atr: number;
+  supertrend: number;
+  trend: number; // 1 = bullish, -1 = bearish
+  signal: "BUY" | "SELL" | null;
+}
+
 // Bộ sinh nến vàng giả lập khi không tìm thấy file CSV vật lý (chống lỗi khởi động và test thử nghiệm)
 export function generateSyntheticBars(startDateStr: string, endDateStr: string): number[][] {
   const klines: number[][] = [];
@@ -24,19 +38,19 @@ export function generateSyntheticBars(startDateStr: string, endDateStr: string):
     return randomMemo / 4294967296;
   };
 
-  const maxGenCount = 80000; // Bảo đảm an toàn bộ nhớ khi thời gian dài
+  const maxGenCount = 100000; // Bảo đảm an toàn bộ nhớ khi thời gian dài
   let count = 0;
 
   for (let ts = startTs; ts <= endTs; ts += step) {
     if (count++ > maxGenCount) break;
-    const change = (randNum() - 0.495) * 1.2;
+    const change = (randNum() - 0.495) * 1.5;
     const open = price;
     const close = parseFloat((price + change).toFixed(2));
-    const noiseHigh = randNum() * 0.6;
-    const noiseLow = randNum() * 0.6;
+    const noiseHigh = randNum() * 0.8;
+    const noiseLow = randNum() * 0.8;
     const high = parseFloat((Math.max(open, close) + noiseHigh).toFixed(2));
     const low = parseFloat((Math.min(open, close) - noiseLow).toFixed(2));
-    const vol = Math.floor(100 + randNum() * 900);
+    const vol = Math.floor(100 + randNum() * 1200);
 
     klines.push([ts, open, high, low, close, vol]);
     price = close;
@@ -45,7 +59,7 @@ export function generateSyntheticBars(startDateStr: string, endDateStr: string):
 }
 
 // Hàm tải dữ liệu cực kỳ thông minh hỗ trợ Mac, Windows, dữ liệu gộp từ thư mục
-export function tryLoadFromXauCsv(startDate: string, endDate: string, timeframe: string) {
+export function tryLoadFromXauCsv(startDate: string, endDate: string, timeframe: string): number[][] {
   let dataDir = path.join(process.cwd(), 'data');
   const customWindowsDir = 'C:\\xau_data';
   const customMacDir = '/Users/giapld/Documents/TL Học Tập/drive-download-20260609T101124Z-3-001';
@@ -142,124 +156,213 @@ export function tryLoadFromXauCsv(startDate: string, endDate: string, timeframe:
   return klines;
 }
 
-function calculateATR(bars: any[], period: number = 14) {
-  if (bars.length < period + 1) return 0;
-  let trs: number[] = [];
-  for (let i = 1; i < bars.length; i++) {
-    const h = bars[i][2], l = bars[i][3], pc = bars[i-1][4];
-    trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+// Hàm tính toán chỉ báo SuperTrend chuẩn hóa dạng chuỗi dữ liệu (tối ưu hóa O(N))
+export function computeSuperTrendSeries(klines: number[][], period: number = 10, multiplier: number = 3.0): SuperTrendBar[] {
+  const bars: SuperTrendBar[] = [];
+  if (klines.length === 0) return [];
+
+  const trs: number[] = [];
+  for (let i = 0; i < klines.length; i++) {
+    const [, , h, l, c] = klines[i];
+    if (i === 0) {
+      trs.push(h - l);
+    } else {
+      const prevC = klines[i - 1][4];
+      trs.push(Math.max(h - l, Math.abs(h - prevC), Math.abs(l - prevC)));
+    }
   }
-  return trs.slice(-period).reduce((a, b) => a + b, 0) / period;
+
+  const atrs: number[] = new Array(klines.length).fill(0);
+  let trSum = 0;
+  for (let i = 0; i < Math.min(period, klines.length); i++) {
+    trSum += trs[i] || 0;
+  }
+  atrs[period - 1] = trSum / period;
+
+  for (let i = period; i < klines.length; i++) {
+    atrs[i] = (atrs[i - 1] * (period - 1) + trs[i]) / period;
+  }
+
+  let prevFinalUpper = 0;
+  let prevFinalLower = 0;
+  let prevTrend = 1;
+
+  for (let i = 0; i < klines.length; i++) {
+    const [ts, o, h, l, c, v] = klines[i];
+    // Chống null index khi dữ liệu nhỏ hơn period
+    const atr = atrs[i] || atrs[period - 1] || (h - l) || 1.0; 
+    const tr = trs[i];
+
+    const hl2 = (h + l) / 2;
+    const basicUpper = hl2 + multiplier * atr;
+    const basicLower = hl2 - multiplier * atr;
+
+    let finalUpper = basicUpper;
+    let finalLower = basicLower;
+
+    if (i > 0) {
+      const prevC = klines[i - 1][4];
+      finalUpper = (basicUpper < prevFinalUpper || prevC > prevFinalUpper) ? basicUpper : prevFinalUpper;
+      finalLower = (basicLower > prevFinalLower || prevC < prevFinalLower) ? basicLower : prevFinalLower;
+    }
+
+    let trend = prevTrend;
+    if (i > 0) {
+      if (c > prevFinalUpper) {
+        trend = 1;
+      } else if (c < prevFinalLower) {
+        trend = -1;
+      } else {
+        trend = prevTrend;
+      }
+    }
+
+    const supertrendValue = trend === 1 ? finalLower : finalUpper;
+
+    let signal: "BUY" | "SELL" | null = null;
+    if (i > 0 && trend !== prevTrend) {
+      signal = trend === 1 ? "BUY" : "SELL";
+    }
+
+    bars.push({
+      time: ts,
+      open: o,
+      high: h,
+      low: l,
+      close: c,
+      volume: v,
+      tr,
+      atr,
+      supertrend: parseFloat(supertrendValue.toFixed(4)),
+      trend,
+      signal
+    });
+
+    prevFinalUpper = finalUpper;
+    prevFinalLower = finalLower;
+    prevTrend = trend;
+  }
+
+  return bars;
 }
 
-function calculateVWMA(bars: any[], period: number) {
-  if (bars.length < period) return bars[bars.length - 1][4];
-  let pv = 0, v = 0;
-  for (let i = bars.length - period; i < bars.length; i++) { pv += bars[i][4] * bars[i][5]; v += bars[i][5]; }
-  return v === 0 ? bars[bars.length - 1][4] : pv / v;
-}
+// Hàm tính toán chỉ báo ADX tối ưu hóa toàn bộ chuỗi nến O(N)
+export function computeADXSeries(klines: number[][], period: number = 14): number[] {
+  const adxArr = new Array(klines.length).fill(0);
+  if (klines.length < period * 2) return adxArr;
 
-function calculateEMA(bars: any[], period: number = 20): number {
-  if (bars.length === 0) return 0;
-  if (bars.length < period) return bars[bars.length - 1][4];
-  const k = 2 / (period + 1);
-  const sliceLen = Math.min(bars.length, period * 4);
-  const startIdx = bars.length - sliceLen;
-  let ema = bars[startIdx][4];
-  for (let i = startIdx + 1; i < bars.length; i++) {
-    ema = bars[i][4] * k + ema * (1 - k);
-  }
-  return ema;
-}
+  const trs: number[] = [];
+  const plusDM: number[] = [];
+  const minusDM: number[] = [];
 
-function calcADX(ohlcv: any[], period: number = 14) {
-  if (ohlcv.length < period * 2) return { adx: 0, pDI: 0, mDI: 0 };
-  let tr: number[] = [], pDM: number[] = [], mDM: number[] = [];
-  for (let i = 1; i < ohlcv.length; i++) {
-    const pc = ohlcv[i - 1][4], [ts, o, h, l, c] = ohlcv[i], ph = ohlcv[i - 1][2], pl = ohlcv[i - 1][3];
-    tr.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
-    const up = h - ph, down = pl - l;
-    pDM.push(up > down && up > 0 ? up : 0);
-    mDM.push(down > up && down > 0 ? down : 0);
-  }
-  const smooth = (arr: number[]) => {
-    let res = [arr.slice(0, period).reduce((a, b) => a + b, 0) / period];
-    for (let i = period; i < arr.length; i++) res.push((res[res.length - 1] * (period - 1) + arr[i]) / period);
-    return res;
-  };
-  const str = smooth(tr), spDM = smooth(pDM), smDM = smooth(mDM);
-  const dx: number[] = [], pDIs: number[] = [], mDIs: number[] = [];
-  for (let i = 0; i < str.length; i++) {
-    const pDI = 100 * (spDM[i] / str[i]), mDI = 100 * (smDM[i] / str[i]);
-    pDIs.push(pDI); mDIs.push(mDI);
-    dx.push(100 * Math.abs(pDI - mDI) / (pDI + mDI || 1));
-  }
-  const adxl = smooth(dx);
-  return { adx: adxl[adxl.length - 1], pDI: pDIs[pDIs.length - 1], mDI: mDIs[mDIs.length - 1] };
-}
+  for (let i = 1; i < klines.length; i++) {
+    const [, , h, l, c] = klines[i];
+    const prevC = klines[i - 1][4];
+    const prevH = klines[i - 1][2];
+    const prevL = klines[i - 1][3];
 
-function detectWhaleSweep(bars: any[]) {
-  if (bars.length < 16) return { sweepLow: false, sweepHigh: false, displacementBullish: false, displacementBearish: false, volConfirm: false, low: 0, high: 0, confirmOpen: 0, confirmClose: 0, sweepOpen: 0 };
+    trs.push(Math.max(h - l, Math.abs(h - prevC), Math.abs(l - prevC)));
+
+    const up = h - prevH;
+    const down = prevL - l;
+
+    plusDM.push(up > down && up > 0 ? up : 0);
+    minusDM.push(down > up && down > 0 ? down : 0);
+  }
+
+  const smoothedTR: number[] = [];
+  const smoothedPlusDM: number[] = [];
+  const smoothedMinusDM: number[] = [];
+
+  let trSum = 0;
+  let pDMSum = 0;
+  let mDMSum = 0;
+
+  for (let i = 0; i < period; i++) {
+    trSum += trs[i] || 0;
+    pDMSum += plusDM[i] || 0;
+    mDMSum += minusDM[i] || 0;
+  }
+
+  smoothedTR[period - 1] = trSum;
+  smoothedPlusDM[period - 1] = pDMSum;
+  smoothedMinusDM[period - 1] = mDMSum;
+
+  for (let i = period; i < trs.length; i++) {
+    smoothedTR[i] = smoothedTR[i - 1] - (smoothedTR[i - 1] / period) + trs[i];
+    smoothedPlusDM[i] = smoothedPlusDM[i - 1] - (smoothedPlusDM[i - 1] / period) + plusDM[i];
+    smoothedMinusDM[i] = smoothedMinusDM[i - 1] - (smoothedMinusDM[i - 1] / period) + minusDM[i];
+  }
+
+  const dx: number[] = [];
+  for (let i = period - 1; i < trs.length; i++) {
+    const tr = smoothedTR[i];
+    const plus = smoothedPlusDM[i];
+    const minus = smoothedMinusDM[i];
+
+    const plusDI = tr > 0 ? (100 * plus) / tr : 0;
+    const minusDI = tr > 0 ? (100 * minus) / tr : 0;
+
+    const sum = plusDI + minusDI;
+    const diff = Math.abs(plusDI - minusDI);
+    const dxValue = sum > 0 ? (100 * diff) / sum : 0;
+    dx.push(dxValue);
+  }
+
+  let dxSum = 0;
+  for (let i = 0; i < period; i++) {
+    dxSum += dx[i] || 0;
+  }
+  let currentADX = dxSum / period;
   
-  const sweepCandle = bars[bars.length - 2]; 
-  const confirmCandle = bars[bars.length - 1]; 
+  const startIdx = 2 * period - 1;
+  if (startIdx < klines.length) {
+    adxArr[startIdx] = currentADX;
+  }
 
-  const [, sO, sH, sL, sC, sV] = sweepCandle;
-  const [, cO, cH, cL, cC, cV] = confirmCandle;
+  for (let i = period; i < dx.length; i++) {
+    const idx = startIdx + (i - period) + 1;
+    if (idx < klines.length) {
+      currentADX = (currentADX * (period - 1) + dx[i]) / period;
+      adxArr[idx] = currentADX;
+    }
+  }
 
-  const prevBars = bars.slice(bars.length - 16, bars.length - 2);
-  const localLow = Math.min(...prevBars.map(b => b[3]));
-  const localHigh = Math.max(...prevBars.map(b => b[2]));
-
-  const sweepSize = sH - sL || 1;
-  const lowerWick = Math.min(sO, sC) - sL;
-  const upperWick = sH - Math.max(sO, sC);
-
-  const volumes = bars.slice(-15, -1).map(b => b[5]);
-  const avgVol = volumes.reduce((a, b) => a + b, 0) / volumes.length;
-
-  const WICK_RATIO = (global as any).CONFIG_WICK_RATIO_VAL ?? 0.25;
-  const sweepLow = sL <= localLow && sC >= localLow && (lowerWick / sweepSize >= WICK_RATIO);
-  const sweepHigh = sH >= localHigh && sC <= localHigh && (upperWick / sweepSize >= WICK_RATIO);
-
-  const body = Math.abs(cC - cO);
-  const totalSize = cH - cL || 1;
-  const bodySizes = bars.slice(-15, -1).map(b => Math.abs(b[4] - b[1]));
-  const avgBody = bodySizes.reduce((a, b) => a + b, 0) / bodySizes.length;
-  
-  const BODY_RATIO = (global as any).CONFIG_BODY_RATIO_VAL ?? 0.60;
-  const CLOSE_RATIO = (global as any).CONFIG_CLOSE_RATIO_VAL ?? 0.45;
-  
-  const displacementBullish = body > avgBody * BODY_RATIO && (cC - cL) / totalSize > CLOSE_RATIO && cC > Math.max(sO, sC);
-  const displacementBearish = body > avgBody * BODY_RATIO && (cH - cC) / totalSize > CLOSE_RATIO && cC < Math.min(sO, sC);
-
-  const isConstantVol = volumes.length > 0 && volumes.every(v => v === volumes[0]);
-  const VOL_RATIO = (global as any).CONFIG_VOL_RATIO_VAL ?? 0.9;
-  const volConfirm = isConstantVol ? true : cV > avgVol * VOL_RATIO;
-
-  return { sweepLow, sweepHigh, displacementBullish, displacementBearish, volConfirm, low: sL, high: sH, confirmOpen: cO, confirmClose: cC, sweepOpen: sO };
+  return adxArr;
 }
 
+// Thực thi Backtest toàn diện dựa hoàn toàn vào chỉ báo SuperTrend
 export async function runBacktest(
   startDate: string,
   endDate: string,
   rr: number,
   timeframe: string,
   enableSessionFilter: boolean,
-  vwmaPeriod: number,
+  vwmaPeriod: number, // tham số giữ nguyên tương thích
   onProgress: (progress: number) => void,
   adxThreshold: number,
   verbose: boolean = false
 ) {
   isRunning = true;
   
-  const data = (global as any).OPTIMIZE_DATA || tryLoadFromXauCsv(startDate, endDate, timeframe);
-  if (!data || data.length === 0) {
+  // Tải dữ liệu klines
+  const rawData = (global as any).OPTIMIZE_DATA || tryLoadFromXauCsv(startDate, endDate, timeframe);
+  if (!rawData || rawData.length === 0) {
     throw new Error('No data found for backtesting. Please upload data/xauusd.csv');
   }
 
   const startTs = new Date(startDate).getTime();
   const endTs = new Date(endDate).getTime();
+
+  // Đọc tham số SuperTrend từ môi trường nếu có, nếu không thì dùng mặc định tốt nhất cho M1 (10, 3.0)
+  const supertrendPeriod = parseInt(process.env.SUPERTREND_PERIOD || "10");
+  const supertrendMultiplier = parseFloat(process.env.SUPERTREND_MULTIPLIER || "3.0");
+
+  console.log(`📡 Đang tối ưu hóa tính toán chỉ báo SuperTrend (${supertrendPeriod}, ${supertrendMultiplier}) + ADX (14) cho ${rawData.length} nến...`);
+  
+  // Tính toán trước toàn bộ dãy chỉ báo trong 1 lượt O(N) siêu nhanh
+  const st_bars = computeSuperTrendSeries(rawData, supertrendPeriod, supertrendMultiplier);
+  const adxSeries = computeADXSeries(rawData, 14);
 
   let balance = 5000;
   let totalProfitR = 0;
@@ -277,54 +380,74 @@ export async function runBacktest(
   const monthlyStats = new Map<string, { trades: number, wins: number, profitR: number, pnlUSD: number }>();
   const tradeHistory: any[] = [];
 
-  for (let i = 50; i < data.length; i++) {
+  // Bắt đầu vòng lặp giả lập giao dịch
+  for (let i = 20; i < st_bars.length; i++) {
     if (!isRunning) break;
     
-    // progress report
-    if (i % 10000 === 0) {
-      const p = Math.floor((i / data.length) * 100);
+    // Báo cáo tiến trình
+    if (i % 12000 === 0) {
+      const p = Math.floor((i / st_bars.length) * 100);
       onProgress(p);
     }
     
-    // Nến vừa đóng hoàn toàn (đóng vai trò là nến -1 ở hiện tại)
-    const slice = data.slice(i-50, i);
-    const lastClosed = slice[slice.length - 1]; // chính là data[i-1]
-    const cTs = lastClosed[0];
-    
-    // Nến đang chạy
-    const currCandle = data[i];
-    const [, cO, cH, cL, cC, cV] = currCandle;
-    
+    const bar = st_bars[i];
+    const cTs = bar.time;
     if (cTs < startTs || cTs > endTs) continue;
 
-    // Quản lý Position (Exit check)
+    // 1. QUẢN LÝ VỊ THẾ ĐANG MỞ (Exit & Trailing check)
     if (paperPosition) {
        let closed = false;
-       let status = "WIN";
-       let exitPrice = cC;
+       let status: "WIN" | "LOSS" = "WIN";
+       let exitPrice = bar.close;
 
+       // Thực hiện cơ chế Trailing Stop Loss theo đường SuperTrend động của thị trường!
        if (paperPosition.type === "LONG") {
-         if (cL <= paperPosition.sl) { 
+         if (bar.supertrend > paperPosition.sl) {
+           paperPosition.sl = bar.supertrend; // Dời SL tiến lên theo band dưới SuperTrend
+         }
+       } else {
+         if (bar.supertrend < paperPosition.sl) {
+           paperPosition.sl = bar.supertrend; // Dời SL lùi xuống theo band trên SuperTrend
+         }
+       }
+
+       // Kiểm tra giá chạm Stop Loss (SL) hoặc Take Profit (TP) trong nến
+       if (paperPosition.type === "LONG") {
+         if (bar.low <= paperPosition.sl) { 
            closed = true; 
            status = "LOSS"; 
            exitPrice = paperPosition.sl;
-         } else if (cH >= paperPosition.tp) { 
+         } else if (bar.high >= paperPosition.tp) { 
            closed = true; 
            status = "WIN"; 
            exitPrice = paperPosition.tp;
          }
        } else {
-         if (cH >= paperPosition.sl) { 
+         if (bar.high >= paperPosition.sl) { 
            closed = true; 
            status = "LOSS"; 
            exitPrice = paperPosition.sl;
-         } else if (cL <= paperPosition.tp) { 
+         } else if (bar.low <= paperPosition.tp) { 
            closed = true; 
            status = "WIN"; 
            exitPrice = paperPosition.tp;
          }
        }
 
+       // Đóng vị thế sớm khi chỉ báo đảo chiều xu hướng (Trend Reversal) trước khi chạm SL/TP
+       if (!closed) {
+          if (paperPosition.type === "LONG" && bar.trend === -1) {
+             closed = true;
+             exitPrice = bar.close;
+             status = exitPrice >= paperPosition.entry ? "WIN" : "LOSS";
+          } else if (paperPosition.type === "SHORT" && bar.trend === 1) {
+             closed = true;
+             exitPrice = bar.close;
+             status = exitPrice <= paperPosition.entry ? "WIN" : "LOSS";
+          }
+       }
+
+       // Xử lý thống kê và cập nhật tài khoản khi lệnh đóng
        if (closed) {
           totalTrades++;
           
@@ -343,15 +466,11 @@ export async function runBacktest(
             stat.wins++;
             stat.profitR += rr;
             pnlDollar = paperPosition.riskUsd * rr;
-            
-            // Reset consecutive losses
             currentConsecutiveLosses = 0;
           } else {
             totalProfitR -= 1;
             stat.profitR -= 1;
             pnlDollar = -paperPosition.riskUsd;
-            
-            // Increment consecutive losses
             currentConsecutiveLosses++;
             if (currentConsecutiveLosses > maxConsecutiveLosses) {
               maxConsecutiveLosses = currentConsecutiveLosses;
@@ -362,7 +481,7 @@ export async function runBacktest(
           balance = parseFloat((balance + pnlDollar).toFixed(2));
           stat.pnlUSD += pnlDollar;
           
-          // Update drawdown
+          // Cập nhật Max Drawdown
           if (balance > peakBalance) {
             peakBalance = balance;
           } else {
@@ -380,11 +499,11 @@ export async function runBacktest(
             id: paperPosition.id,
             type: paperPosition.type,
             entryPrice: paperPosition.entry,
-            exitPrice: parseFloat(exitPrice.toFixed(2)),
+            exitPrice: parseFloat(exitPrice.toFixed(4)),
             time: new Date(cTs).toISOString(),
             status: status,
             reason: status === "WIN" ? "TP" : "SL",
-            pnl: pnlDollar,
+            pnl: parseFloat(pnlDollar.toFixed(2)),
             balanceBefore,
             balanceAfter: balance
           };
@@ -397,93 +516,85 @@ export async function runBacktest(
 
           paperPosition = null;
        }
-       continue; // Cooldown / 1 bar 1 lệnh
+       continue; // Đảm bảo cooldown 1 nến sau khi đóng lệnh mới tìm cơ hội khác
     }
 
-    // Lọc theo Session
-    const date = new Date(cTs);
-    const hoursGMT = date.getUTCHours();
-    const SESSION_START_GMT = 8;
-    const SESSION_END_GMT = 21;
-    let isInSession = true;
-    if (enableSessionFilter) {
-       if (SESSION_START_GMT <= SESSION_END_GMT) {
-         isInSession = hoursGMT >= SESSION_START_GMT && hoursGMT < SESSION_END_GMT;
-       } else {
-         isInSession = hoursGMT >= SESSION_START_GMT || hoursGMT < SESSION_END_GMT;
-       }
-    }
-
-    // Tính Indicator (Dựa trên slice của các nến đã đóng)
-    const atrM1 = calculateATR(slice, 14);
-    const vwmaM1 = calculateVWMA(slice, vwmaPeriod);
-    const emaM1 = calculateEMA(slice, 20);
-    const adxM1 = calcADX(slice, 14);
-    const sweep = detectWhaleSweep(slice);
-
-    const closePriceM1 = lastClosed[4];
-    const distFromVWMA = Math.abs(closePriceM1 - vwmaM1);
-    const bullishM1 = closePriceM1 > emaM1 && closePriceM1 > vwmaM1 && emaM1 > vwmaM1;
-    const bearishM1 = closePriceM1 < emaM1 && closePriceM1 < vwmaM1 && emaM1 < vwmaM1;
-
-    let sig: "LONG" | "SHORT" | null = null;
-    const isOverExtendedLong = distFromVWMA > (atrM1 * 1.2);
-    const isOverExtendedShort = distFromVWMA > (atrM1 * 1.2);
-
-    const slDistanceLong = Math.abs(closePriceM1 - sweep.low);
-    const slDistanceShort = Math.abs(sweep.high - closePriceM1);
-    const hasBadEntryPriceLong = slDistanceLong > (atrM1 * 4.0);
-    const hasBadEntryPriceShort = slDistanceShort > (atrM1 * 4.0);
-
-    // Xác nhận vào lệnh Long
-    if ( !isOverExtendedLong && !hasBadEntryPriceLong && adxM1.adx >= adxThreshold && sweep.sweepLow && sweep.displacementBullish && sweep.volConfirm && isInSession && (sweep.confirmClose > sweep.sweepOpen || sweep.confirmClose > sweep.high) && bullishM1 ) {
-      sig = "LONG";
-    }
-
-    // Xác nhận vào lệnh Short
-    if ( !isOverExtendedShort && !hasBadEntryPriceShort && adxM1.adx >= adxThreshold && sweep.sweepHigh && sweep.displacementBearish && sweep.volConfirm && isInSession && (sweep.confirmClose < sweep.sweepOpen || sweep.confirmClose < sweep.low) && bearishM1 ) {
-      sig = "SHORT";
-    }
+    // 2. TÌM KIẾM CƠ HỘI VÀO LỆNH (LONG / SHORT signals on closed bar i-1)
+    const prevBar = st_bars[i - 1];
+    const sig = prevBar.signal; // "BUY" hoặc "SELL" được kích hoạt khi nến vừa đóng hoàn toàn
 
     if (sig) {
-      const e = closePriceM1; // Vào lệnh dựa vào giá mở cửa nến hiện tại (bằng với close nến trước)
-      const slRaw = sig === "LONG" ? (sweep.low - atrM1 * 0.2) : (sweep.high + atrM1 * 0.2);
-      const minRisk = atrM1 * 1.5;
-      let sl = 0;
-      if (sig === "LONG") {
-        sl = Math.min(slRaw, closePriceM1 - minRisk);
-      } else {
-        sl = Math.max(slRaw, closePriceM1 + minRisk);
-      }
-      
-      const risk = Math.abs(e - sl);
-      const tp = sig === "LONG" ? e + risk * rr : e - risk * rr;
-
-      const riskUsdStr = process.env.MT5_RISK_USD;
-      let tradeRiskUsd = balance * 0.01; // Mặc định 1% tài khoản 5000 = 50$
-      if (riskUsdStr) {
-         const parsedRisk = parseFloat(riskUsdStr);
-         if (!isNaN(parsedRisk) && parsedRisk > 0) {
-             tradeRiskUsd = parsedRisk;
-         } else {
-             const fixedLot = parseFloat(process.env.MT5_LOT_SIZE || "0.01");
-             const contractSize = parseFloat(process.env.MT5_CONTRACT_SIZE || "100");
-             tradeRiskUsd = fixedLot * contractSize * risk;
-         }
-      } else {
-         const fixedLot = parseFloat(process.env.MT5_LOT_SIZE || "0.01");
-         const contractSize = parseFloat(process.env.MT5_CONTRACT_SIZE || "100");
-         tradeRiskUsd = fixedLot * contractSize * risk;
+      // Bộ lọc giờ giao dịch (Session Filter - Giữ an toàn vốn, đặc biệt giao dịch Vàng M1)
+      const date = new Date(cTs);
+      const hoursGMT = date.getUTCHours();
+      const SESSION_START_GMT = 8;
+      const SESSION_END_GMT = 21;
+      let isInSession = true;
+      if (enableSessionFilter) {
+         isInSession = hoursGMT >= SESSION_START_GMT && hoursGMT < SESSION_END_GMT;
       }
 
-      paperPosition = {
-        id: `T-${sig}-${i}`,
-        type: sig,
-        entry: e,
-        sl: sl,
-        tp: tp,
-        riskUsd: tradeRiskUsd
-      };
+      // Bộ lọc ADX để lọc nhiễu sideway (Nếu có kích hoạt adxThreshold > 0)
+      const adxVal = adxSeries[i - 1] || 0;
+      const satisfiesADX = adxThreshold <= 0 || adxVal >= adxThreshold;
+
+      if (isInSession && satisfiesADX) {
+        const e = bar.open; // Vào lệnh tại giá mở cửa của nến hiện tại (ngay khi chỉ báo nến trước chốt)
+        let sl = prevBar.supertrend; // SL đặt ngay tại giá trị đường SuperTrend của nến tín hiệu
+        
+        // Quản lý an toàn khoảng Stop Loss (Enforce minimum risk based on ATR)
+        const minRisk = prevBar.atr * 1.5;
+        if (sig === "BUY") {
+          if (e - sl < minRisk) {
+            sl = e - minRisk;
+          }
+          const riskDistance = e - sl;
+          const tp = e + riskDistance * rr;
+
+          // Thiết lập mức quản lý rủi ro trên tài khoản (default: 1% balance)
+          const riskUsdStr = process.env.MT5_RISK_USD;
+          let tradeRiskUsd = balance * 0.01;
+          if (riskUsdStr) {
+             const parsedRisk = parseFloat(riskUsdStr);
+             if (!isNaN(parsedRisk) && parsedRisk > 0) {
+                 tradeRiskUsd = parsedRisk;
+             }
+          }
+
+          paperPosition = {
+            id: `T-${sig}-${i}`,
+            type: "LONG",
+            entry: e,
+            sl: parseFloat(sl.toFixed(4)),
+            tp: parseFloat(tp.toFixed(4)),
+            riskUsd: tradeRiskUsd
+          };
+        } else if (sig === "SELL") {
+          if (sl - e < minRisk) {
+            sl = e + minRisk;
+          }
+          const riskDistance = sl - e;
+          const tp = e - riskDistance * rr;
+
+          const riskUsdStr = process.env.MT5_RISK_USD;
+          let tradeRiskUsd = balance * 0.01;
+          if (riskUsdStr) {
+             const parsedRisk = parseFloat(riskUsdStr);
+             if (!isNaN(parsedRisk) && parsedRisk > 0) {
+                 tradeRiskUsd = parsedRisk;
+             }
+          }
+
+          paperPosition = {
+            id: `T-${sig}-${i}`,
+            type: "SHORT",
+            entry: e,
+            sl: parseFloat(sl.toFixed(4)),
+            tp: parseFloat(tp.toFixed(4)),
+            riskUsd: tradeRiskUsd
+          };
+        }
+      }
     }
   }
 
@@ -492,7 +603,7 @@ export async function runBacktest(
     whaleTrades: stat.trades,
     whaleWins: stat.wins,
     whalePnLR: stat.profitR,
-    pnl: stat.pnlUSD
+    pnl: parseFloat(stat.pnlUSD.toFixed(2))
   }));
   
   monthlySnapshots.sort((a, b) => a.date.localeCompare(b.date));
@@ -500,14 +611,14 @@ export async function runBacktest(
   const results = {
     startTime: startDate,
     endTime: endDate,
-    finalBalance: balance,
-    totalProfitR: totalProfitR,
+    finalBalance: parseFloat(balance.toFixed(2)),
+    totalProfitR: parseFloat(totalProfitR.toFixed(2)),
     totalTrades: totalTrades,
     wins: wins,
     losses: totalTrades - wins,
     maxConsecutiveLosses,
-    maxDrawdownPercent,
-    maxDrawdownValue,
+    maxDrawdownPercent: parseFloat(maxDrawdownPercent.toFixed(2)),
+    maxDrawdownValue: parseFloat(maxDrawdownValue.toFixed(2)),
     monthlySnapshots
   };
 
