@@ -1,0 +1,6 @@
+{
+  "name": "Gold SuperTrend Bot MT5",
+  "description": "Hệ thống quản lý, lập cấu hình và mô phỏng bot giao dịch Vàng (XAUUSD) khung 1 phút (M1) sử dụng chỉ báo SuperTrend qua kết nối MetaTrader 5 và PM2.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
