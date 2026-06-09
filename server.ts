@@ -6,7 +6,7 @@ import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
 
-// Initialize Gemini Client
+// Khởi tạo Gemini AI Client từ thư viện chính thức @google/genai dùng để tối ưu hóa chiến lược
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY || "",
   httpOptions: {
@@ -16,44 +16,47 @@ const ai = new GoogleGenAI({
   },
 });
 
+// Định nghĩa cấu trúc dữ liệu nến (OHLCV)
 interface Candle {
-  time: number; // Unix timestamp
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
+  time: number; // Unix timestamp tính bằng mili giây
+  open: number;  // Giá mở cửa
+  high: number;  // Giá cao nhất
+  low: number;   // Giá thấp nhất
+  close: number; // Giá đóng cửa
+  volume: number; // Khối lượng giao dịch
 }
 
+// Định nghĩa cấu trúc dữ liệu nến có chứa các chỉ báo SuperTrend phụ trợ
 interface SupertrendBar extends Candle {
-  tr: number;
-  atr: number;
-  upperBand: number;
-  lowerBand: number;
-  supertrend: number;
-  trend: 1 | -1;
-  signal: "BUY" | "SELL" | null;
+  tr: number;         // True Range (Khoảng biến động thực tế)
+  atr: number;        // Average True Range (Trung bình khoảng biến động thực tế)
+  upperBand: number;  // Dải trên của SuperTrend (Kháng cự)
+  lowerBand: number;  // Dải dưới của SuperTrend (Hỗ trợ)
+  supertrend: number; // Giá trị đường SuperTrend hiện tại
+  trend: 1 | -1;      // Xu hướng thị trường: 1 = Tăng (Bullish), -1 = Giảm (Bearish)
+  signal: "BUY" | "SELL" | null; // Tín hiệu kích hoạt lệnh: BUY (Mua), SELL (Bán) hoặc null
 }
 
+// Định nghĩa cấu trúc lưu vết một lệnh giao dịch giả lập
 interface Trade {
-  id: string;
-  type: "BUY" | "SELL";
-  entryPrice: number;
-  entryTime: number;
-  exitPrice: number;
-  exitTime: number;
-  size: number;
-  profit: number;
-  status: "CLOSED" | "OPEN";
+  id: string;               // Mã định danh duy nhất của giao dịch
+  type: "BUY" | "SELL";     // Loại lệnh: BUY (Mua) hoặc SELL (Bán)
+  entryPrice: number;       // Giá kích hoạt vào lệnh
+  entryTime: number;        // Thời gian vào lệnh (Unix timestamp)
+  exitPrice: number;        // Giá đóng lệnh (chốt lời/dừng lỗ hoặc đảo chiều)
+  exitTime: number;         // Thời gian đóng lệnh
+  size: number;             // Khối lượng lót giao dịch (Lot size)
+  profit: number;           // Lợi nhuận/Thua lỗ thực tế tính theo USD
+  status: "CLOSED" | "OPEN"; // Trạng thái lệnh: Đã đóng (CLOSED) hoặc Đang mở (OPEN)
 }
 
-// Generate a realistic M1 (1-minute) stream of Gold charts
+// Hàm sinh dữ liệu đồ thị XAUUSD M1 giả lập khi chạy thử nghiệm hoặc không có dữ liệu CSV vật lý
 function generateXAUUSDCandles(count: number = 200, seed: number = 42): Candle[] {
-  let price = 2645.50; // Starting Gold price (XAUUSD)
+  let price = 2645.50; // Giá Vàng khởi điểm mặc định (XAUUSD)
   const candles: Candle[] = [];
-  let currentTime = Date.now() - count * 60 * 1000;
+  let currentTime = Date.now() - count * 60 * 1000; // Thời gian bắt đầu tính lùi về quá khứ
 
-  // Linear feedback shift register/pseudo-random values that look like organic gold noise
+  // Bộ nhớ số ngẫu nhiên tuần hoàn để tạo xu hướng sóng gold tự nhiên
   let randomMemo = seed;
   const parseRand = () => {
     randomMemo = (randomMemo * 1664525 + 1013904223) % 4294967296;
@@ -62,11 +65,11 @@ function generateXAUUSDCandles(count: number = 200, seed: number = 42): Candle[]
 
   for (let i = 0; i < count; i++) {
     const time = currentTime + i * 60 * 1000;
-    const change = (parseRand() - 0.495) * 2.5; // Slight bullish bias + standard gold volatility
+    const change = (parseRand() - 0.495) * 2.5; // Động lực biến động có lợi cho xu hướng tăng nhẹ
     const open = price;
     const close = parseFloat((price + change).toFixed(2));
     
-    // Volatility spikes on gold
+    // Giả lập mức râu nến (Wick) dao động mạnh đặc trưng của Vàng
     const noiseHigh = parseRand() * 1.5;
     const noiseLow = parseRand() * 1.5;
     const high = parseFloat((Math.max(open, close) + noiseHigh).toFixed(2));
@@ -79,13 +82,13 @@ function generateXAUUSDCandles(count: number = 200, seed: number = 42): Candle[]
   return candles;
 }
 
-// Compute SuperTrend Indicator logic equivalent to MT5/TradingView
+// Hàm tính toán chỉ báo SuperTrend chuẩn hóa tương đương MT5 và TradingView
 function calculateSuperTrend(candles: Candle[], period: number, multiplier: number): SupertrendBar[] {
   const bars: SupertrendBar[] = [];
   
   if (candles.length === 0) return [];
 
-  // Step 1: Calculate True Range (TR)
+  // Bước 1: Tính khoảng biến động thực tế True Range (TR)
   const trs: number[] = [candles[0].high - candles[0].low];
   for (let i = 1; i < candles.length; i++) {
     const cur = candles[i];
@@ -98,11 +101,11 @@ function calculateSuperTrend(candles: Candle[], period: number, multiplier: numb
     trs.push(tr);
   }
 
-  // Step 2: Calculate ATR (Simple Moving Average of TR as standard in many Supertrend versions)
+  // Bước 2: Tính toán Average True Range (ATR) làm mượt biến động
   const atrs: number[] = [];
   for (let i = 0; i < candles.length; i++) {
     if (i < period - 1) {
-      atrs.push(candles[0].high - candles[0].low); // Fallback
+      atrs.push(candles[0].high - candles[0].low); // FALLBACK khi nến đầu tiên chưa đủ chu kỳ
     } else {
       let sum = 0;
       for (let j = i - period + 1; j <= i; j++) {
@@ -112,9 +115,9 @@ function calculateSuperTrend(candles: Candle[], period: number, multiplier: numb
     }
   }
 
-  // Step 3: Compute Bands and Signal
+  // Bước 3: Tính toán các dải UpperBand, LowerBand của dải Supertrend
   let prevSupertrend = 0;
-  let prevTrend: 1 | -1 = 1; // 1 = Buy (bullish), -1 = Sell (bearish)
+  let prevTrend: 1 | -1 = 1; // 1 = Xu hướng tăng, -1 = Xu hướng giảm
   let prevFinalUpper = 0;
   let prevFinalLower = 0;
 
@@ -127,7 +130,7 @@ function calculateSuperTrend(candles: Candle[], period: number, multiplier: numb
     const basicUpper = hl2 + multiplier * atr;
     const basicLower = hl2 - multiplier * atr;
 
-    // Calculate Final Upper Band
+    // Tính toán dải kháng cự trên dịch chuyển cuối cùng
     let finalUpper = basicUpper;
     if (i > 0) {
       const prevCandle = candles[i - 1];
@@ -138,7 +141,7 @@ function calculateSuperTrend(candles: Candle[], period: number, multiplier: numb
       }
     }
 
-    // Calculate Final Lower Band
+    // Tính toán dải hỗ trợ dưới dịch chuyển cuối cùng
     let finalLower = basicLower;
     if (i > 0) {
       const prevCandle = candles[i - 1];
@@ -149,7 +152,7 @@ function calculateSuperTrend(candles: Candle[], period: number, multiplier: numb
       }
     }
 
-    // Determine current Trend and Supertrend value
+    // Đổi vai trò xu hướng dựa trên mức giá đóng cửa nến
     let trend: 1 | -1 = prevTrend;
     let supertrend = 0;
 
@@ -165,6 +168,7 @@ function calculateSuperTrend(candles: Candle[], period: number, multiplier: numb
 
     supertrend = trend === 1 ? finalLower : finalUpper;
 
+    // Sinh tín hiệu mua bán tại điểm giao thoa đầu tiên
     let signal: "BUY" | "SELL" | null = null;
     if (i > 0 && trend !== prevTrend) {
       signal = trend === 1 ? "BUY" : "SELL";
@@ -190,60 +194,55 @@ function calculateSuperTrend(candles: Candle[], period: number, multiplier: numb
   return bars;
 }
 
-// Backtester Engine applying SuperTrend logic
+// Bộ máy chạy thử nghiệm lịch sử giả lập (Backtest Engine Server) sử dụng dữ liệu nến thô trên UI
 function runBacktest(bars: SupertrendBar[], lotSize: number, tp: number, sl: number) {
   const trades: Trade[] = [];
   let currentTrade: Trade | null = null;
   let runningPnL = 0;
 
   bars.forEach((bar, index) => {
-    // If there is an active trade, check stop-loss & take-profit or trend reversal exits
+    // 1. Quản lý lệnh đang mở (kiểm tra chạm chốt lời TP, dừng lỗ SL hoặc tín hiệu đảo chiều)
     if (currentTrade) {
-      const pipsFactor = 0.1; // Gold moves in dollars. Let's assume 1 unit of tp/sl corresponds to $0.10 movement.
+      const pipsFactor = 0.1; // Chuyển đổi điểm số: 1 điểm với Vàng tương ứng $0.10 sóng dịch chuyển
       
       let shouldExit = false;
       let exitPrice = bar.close;
 
       if (currentTrade.type === "BUY") {
-        const currentProfit = (bar.high - currentTrade.entryPrice) * 100 * lotSize; // standard XAUUSD contract sizes (100 oz per lot)
-        const currentLoss = (currentTrade.entryPrice - bar.low) * 100 * lotSize;
-
-        // Check TP
+        // Kiểm tra điều kiện chốt lời Take Profit bằng điểm
         if (tp > 0 && (bar.high - currentTrade.entryPrice) >= (tp * pipsFactor)) {
           exitPrice = currentTrade.entryPrice + (tp * pipsFactor);
           shouldExit = true;
         }
-        // Check SL
+        // Kiểm tra điều kiện dừng lỗ Stop Loss bằng điểm
         else if (sl > 0 && (currentTrade.entryPrice - bar.low) >= (sl * pipsFactor)) {
           exitPrice = currentTrade.entryPrice - (sl * pipsFactor);
           shouldExit = true;
         }
-        // Reversal signal exits
+        // Tự động đóng lệnh sớm khi chỉ báo vẽ tín hiệu SELL để bảo toàn tài khoản
         else if (bar.signal === "SELL") {
-          exitPrice = bar.open; // Exit at open of reversal bar
+          exitPrice = bar.open; // Chốt lệnh trực tiếp ngay tại giá mở cửa nến đối diện
           shouldExit = true;
         }
-      } else { // SELL trade
-        const currentProfit = (currentTrade.entryPrice - bar.low) * 100 * lotSize;
-        const currentLoss = (bar.high - currentTrade.entryPrice) * 100 * lotSize;
-
-        // Check TP
+      } else { // Xử lý lệnh SELL đang mở
+        // Kiểm tra điều kiện chốt lời Take Profit bằng điểm
         if (tp > 0 && (currentTrade.entryPrice - bar.low) >= (tp * pipsFactor)) {
           exitPrice = currentTrade.entryPrice - (tp * pipsFactor);
           shouldExit = true;
         }
-        // Check SL
+        // Kiểm tra điều kiện dừng lỗ Stop Loss bằng điểm
         else if (sl > 0 && (bar.high - currentTrade.entryPrice) >= (sl * pipsFactor)) {
           exitPrice = currentTrade.entryPrice + (sl * pipsFactor);
           shouldExit = true;
         }
-        // Reversal signal exits
+        // Tự động đóng lệnh sớm khi chỉ báo vẽ tín hiệu BUY để đảo đầu lệnh
         else if (bar.signal === "BUY") {
           exitPrice = bar.open;
           shouldExit = true;
         }
       }
 
+      // Lưu trữ thông tin sau khi giao dịch đóng hoàn tất
       if (shouldExit) {
         const profitMultiplier = currentTrade.type === "BUY" ? 1 : -1;
         const finalProfit = parseFloat(((exitPrice - currentTrade.entryPrice) * 100 * lotSize * profitMultiplier).toFixed(2));
@@ -258,7 +257,7 @@ function runBacktest(bars: SupertrendBar[], lotSize: number, tp: number, sl: num
       }
     }
 
-    // Process new signals
+    // 2. Kích hoạt giao dịch mới dựa trên tín hiệu đóng nến
     if (!currentTrade) {
       if (bar.signal === "BUY") {
         currentTrade = {
@@ -288,7 +287,7 @@ function runBacktest(bars: SupertrendBar[], lotSize: number, tp: number, sl: num
     }
   });
 
-  // Keep final open trade in the logs for transparency
+  // Giữ lại giao dịch cuối cùng chưa đóng để hiển thị minh bạch cho người dùng
   if (currentTrade) {
     trades.push(currentTrade);
   }
